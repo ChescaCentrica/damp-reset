@@ -122,8 +122,14 @@ from mould_risk import MoistureRiskState, RiskConfig, evaluate_moisture_risk
 from psychrometrics import AirState
 from surface_risk import SurfaceDescriptor
 from thermal import ThermalProperties
-from time_simulation import VentilationEvent, simulate_room_period
+from time_simulation import (
+    RoomTrajectory,
+    VentilationEvent,
+    simulate_room_period,
+    simulate_room_period_with_forecast,
+)
 from ventilation import VentilationSimulationResult, simulate_ventilation_event
+from weather_forecast import WeatherForecast
 
 
 @dataclass(frozen=True)
@@ -2126,6 +2132,679 @@ def optimise_min_energy_under_risk_limit(
         objective_name=objective_name,
         feasible=True,
         reason=reason,
+    )
+
+
+@dataclass(frozen=True)
+class ScheduledAction:
+    """A candidate "start at T, ventilate for D minutes" action.
+
+    Fields:
+        start_time_hours: when in the control horizon the window
+            opens, in hours since t = 0. Non-negative. Zero means
+            "ventilate now"; any positive value means "wait, then
+            ventilate".
+        duration_minutes: how long the window stays open. Zero
+            means "do nothing" (the start time is irrelevant in that
+            case, but a caller who wants an explicit do-nothing
+            entry can supply ``ScheduledAction(0.0, 0.0)`` and read
+            it back for audit).
+
+    Validation:
+        Both fields must be finite and non-negative. The
+        combination ``start_time_hours + duration_minutes / 60`` must
+        not exceed the caller's control horizon; this is checked in
+        ``optimise_scheduled_action_under_risk_limit`` where the
+        horizon is known.
+    """
+
+    start_time_hours: float
+    duration_minutes: float
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("start_time_hours", self.start_time_hours),
+            ("duration_minutes", self.duration_minutes),
+        ):
+            if not isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value!r}")
+            if value < 0.0:
+                raise ValueError(
+                    f"{name} must be non-negative, got {value}"
+                )
+
+    @property
+    def is_do_nothing(self) -> bool:
+        return self.duration_minutes == 0.0
+
+
+@dataclass(frozen=True)
+class ScheduledActionResult:
+    """Selected (start-time, duration) action under a risk ceiling.
+
+    Extends the shape of ``RiskConstrainedOptimisationResult`` with
+    the START TIME the optimiser chose. Baseline (do-nothing) risk
+    is preserved as the counterfactual so the caller sees what
+    would have happened without any action.
+
+    Fields:
+        selected_action: the winning ``ScheduledAction``. Set to
+            ``ScheduledAction(0.0, 0.0)`` when do-nothing wins; the
+            ``selected_action`` on an infeasible result is populated
+            from the closest miss the optimiser looked at, so
+            branches on ``feasible`` before reading it.
+        baseline_risk: predicted ``MoistureRiskState`` over the
+            control horizon if NO action is taken. Always populated.
+        selected_risk: predicted ``MoistureRiskState`` over the
+            control horizon after the selected action.
+        pre_action_risk: predicted ``MoistureRiskState`` over the
+            slice [t=0, selected_action.start_time_hours) - i.e.
+            the risk exposure the room would accrue during the wait
+            before the ventilation event. Zero when the selected
+            start time is 0 (ventilate now). Callers can inspect
+            this to verify the "do not wait if waiting alone
+            breaches the ceiling" rule was applied.
+        energy_penalty_kwh: heat energy predicted to leave the room
+            during the ventilation window. Zero when do-nothing wins.
+        final_indoor_temperature_c: predicted indoor temperature at
+            the END of the control horizon. Useful when comparing
+            controllers.
+        final_indoor_absolute_humidity_g_m3: predicted indoor AH at
+            the end of the horizon.
+        final_indoor_relative_humidity_pct: predicted indoor RH at
+            the end of the horizon.
+        objective_name: fixed at
+            ``"minimum ventilation energy under risk limit (scheduled)"``.
+        feasible: True when at least one candidate satisfied every
+            constraint (risk during wait, risk over full horizon,
+            comfort).
+        reason: one-sentence explanation of the choice; on failure,
+            names which constraint could not be met.
+    """
+
+    selected_action: ScheduledAction
+    baseline_risk: MoistureRiskState
+    selected_risk: MoistureRiskState
+    pre_action_risk: MoistureRiskState
+    energy_penalty_kwh: float
+    final_indoor_temperature_c: float
+    final_indoor_absolute_humidity_g_m3: float
+    final_indoor_relative_humidity_pct: float
+    objective_name: str
+    feasible: bool
+    reason: str
+
+
+def _slice_trajectory(
+    trajectory: RoomTrajectory, up_to_time_hours: float
+) -> RoomTrajectory:
+    """Return the trajectory samples with ``times_hours[i] < up_to_time_hours``.
+
+    Preserves at least one sample (t = 0.0) so downstream risk
+    evaluation over the slice is always defined; the risk indicator
+    handles a single-sample trajectory as zero exposure.
+    """
+    end_index = 0
+    for i, t in enumerate(trajectory.times_hours):
+        if t < up_to_time_hours:
+            end_index = i + 1
+        else:
+            break
+    end_index = max(end_index, 1)
+    return RoomTrajectory(
+        times_hours=trajectory.times_hours[:end_index],
+        indoor_temperature_c=trajectory.indoor_temperature_c[:end_index],
+        indoor_absolute_humidity_g_m3=trajectory.indoor_absolute_humidity_g_m3[
+            :end_index
+        ],
+        indoor_relative_humidity_pct=trajectory.indoor_relative_humidity_pct[
+            :end_index
+        ],
+        outdoor_temperature_c=trajectory.outdoor_temperature_c[:end_index],
+        outdoor_absolute_humidity_g_m3=trajectory.outdoor_absolute_humidity_g_m3[
+            :end_index
+        ],
+        window_open=trajectory.window_open[:end_index],
+        moisture_generation_g_per_hour=trajectory.moisture_generation_g_per_hour[
+            :end_index
+        ],
+    )
+
+
+def _simulate_scheduled_action(
+    room: Room,
+    thermal_properties: ThermalProperties,
+    forecast: WeatherForecast,
+    moisture_schedule: MoistureSourceSchedule,
+    action: ScheduledAction,
+    control_horizon_hours: float,
+    trajectory_timestep_minutes: float,
+) -> RoomTrajectory:
+    """Simulate the room over the control horizon under one scheduled action.
+
+    A do-nothing action produces the baseline trajectory (no
+    ventilation event scheduled). A positive-duration action places
+    a single ``VentilationEvent`` starting at
+    ``action.start_time_hours`` and ending
+    ``action.duration_minutes / 60`` hours later.
+
+    Delegates entirely to
+    ``time_simulation.simulate_room_period_with_forecast`` -
+    no physics is done here.
+    """
+    if action.is_do_nothing:
+        events: Tuple[VentilationEvent, ...] = ()
+    else:
+        events = (
+            VentilationEvent(
+                start_time_hours=action.start_time_hours,
+                end_time_hours=(
+                    action.start_time_hours + action.duration_minutes / 60.0
+                ),
+            ),
+        )
+    return simulate_room_period_with_forecast(
+        room=room,
+        thermal_properties=thermal_properties,
+        forecast=forecast,
+        moisture_schedule=moisture_schedule,
+        ventilation_events=events,
+        duration_hours=control_horizon_hours,
+        timestep_minutes=trajectory_timestep_minutes,
+    )
+
+
+def optimise_scheduled_action_under_risk_limit(
+    room: Room,
+    thermal_properties: ThermalProperties,
+    forecast: WeatherForecast,
+    moisture_schedule: MoistureSourceSchedule,
+    candidate_actions: Sequence[ScheduledAction],
+    constraints: VentilationConstraints,
+    surface: SurfaceDescriptor,
+    risk_config: RiskConfig,
+    control_horizon_hours: float,
+    trajectory_timestep_minutes: float,
+) -> ScheduledActionResult:
+    """Pick the lowest-energy (start, duration) action within a risk ceiling.
+
+    Extends ``optimise_min_energy_under_risk_limit`` in two ways:
+
+        1. Candidates are ``ScheduledAction`` values with an explicit
+           START TIME as well as a duration. The optimiser chooses
+           when to ventilate, not just how long.
+        2. Outdoor conditions come from a ``WeatherForecast`` so the
+           choice of start time can exploit predicted outdoor state
+           (e.g. wait for the weather to warm up before ventilating).
+
+    Algorithm:
+        For each candidate action:
+            a. Simulate the room over the full control horizon with
+               the forecast supplying outdoor conditions at every
+               step. If the action is do-nothing, no window opens;
+               otherwise a single ventilation event runs during
+               ``[start_time_hours, start_time_hours + duration/60)``.
+            b. Evaluate the cumulative risk indicator over the whole
+               trajectory.
+            c. If the action has a strictly positive
+               ``start_time_hours``, ALSO evaluate the risk indicator
+               over the pre-ventilation slice
+               ``times < start_time_hours``. If that pre-slice already
+               exceeds the caller's risk ceiling, the action is
+               REJECTED: waiting alone would breach the constraint.
+            d. Apply the comfort constraints on ``constraints`` to
+               the ventilation event via
+               ``simulate_ventilation_event`` (using the outdoor
+               state that will be current AT THE START of the
+               event); reject candidates that fail comfort.
+        Among the surviving feasible candidates, pick the one with
+        the lowest ventilation-event energy penalty (reading indoor
+        T at the trajectory samples that bracket the event and
+        applying the caller's ``effective_thermal_capacity_j_per_k``).
+        Ties on energy break to the earliest start time (act sooner
+        when tied), then to the shortest duration.
+
+    Do-nothing is always considered; when the baseline trajectory
+    already sits at or below the risk ceiling, do-nothing wins on
+    energy (zero) and the reason names the counterfactual.
+
+    Failure modes (``feasible = False``):
+        * No candidate keeps the risk below the ceiling AND respects
+          comfort. The reason names the tightest miss.
+        * ``max_cumulative_risk_score`` not set on ``constraints``:
+          the strategy has no ceiling to enforce and returns
+          infeasible.
+        * A candidate's ``start_time_hours + duration/60`` exceeds
+          the caller's control horizon: rejected up-front with a
+          ValueError.
+
+    Delegation contract:
+        The trajectory, risk indicator, and single-event comfort
+        check all come from their owning modules. This strategy
+        contributes decision logic only; no physics equation is
+        redefined here.
+
+    CALIBRATION WARNING:
+        Same disclaimer that applies to
+        ``optimise_min_energy_under_risk_limit``. The risk indicator
+        is a caller-configured INDICATOR (not a validated
+        mould-growth prediction); the ceiling and the surface fRsi
+        are POC caller inputs. See ``mould_risk`` and
+        ``surface_risk`` module docstrings.
+
+    Args:
+        room: room initial state and ACH profile.
+        thermal_properties: lumped effective thermal capacity.
+        forecast: ``WeatherForecast`` covering at least the control
+            horizon. Extrapolation beyond the horizon holds the last
+            reading.
+        moisture_schedule: moisture-source schedule for the control
+            horizon.
+        candidate_actions: non-empty sequence of ``ScheduledAction``
+            values. Every action's
+            ``start_time_hours + duration_minutes / 60`` must be at
+            most ``control_horizon_hours``.
+        constraints: ``VentilationConstraints``. The
+            ``max_cumulative_risk_score`` ceiling must be set;
+            comfort constraints (``max_temperature_drop_c``,
+            ``max_energy_loss_kwh``) are applied to the single event.
+        surface: ``SurfaceDescriptor`` for the surface whose exposure
+            drives the risk indicator.
+        risk_config: caller's ``RiskConfig`` (thresholds and
+            weights).
+        control_horizon_hours: how far ahead to simulate before
+            evaluating cumulative risk. Must be strictly positive.
+        trajectory_timestep_minutes: step size for
+            ``simulate_room_period_with_forecast``. Must be strictly
+            positive.
+
+    Returns:
+        A ``ScheduledActionResult`` describing the selected action
+        and its predicted consequences.
+    """
+    if not isfinite(control_horizon_hours):
+        raise ValueError(
+            f"control_horizon_hours must be finite, got {control_horizon_hours!r}"
+        )
+    if control_horizon_hours <= 0.0:
+        raise ValueError(
+            "control_horizon_hours must be strictly positive, got "
+            f"{control_horizon_hours}"
+        )
+    if not isfinite(trajectory_timestep_minutes):
+        raise ValueError(
+            "trajectory_timestep_minutes must be finite, got "
+            f"{trajectory_timestep_minutes!r}"
+        )
+    if trajectory_timestep_minutes <= 0.0:
+        raise ValueError(
+            "trajectory_timestep_minutes must be strictly positive, got "
+            f"{trajectory_timestep_minutes}"
+        )
+    if len(candidate_actions) == 0:
+        raise ValueError(
+            "candidate_actions must contain at least one ScheduledAction."
+        )
+    for action in candidate_actions:
+        end_time = action.start_time_hours + action.duration_minutes / 60.0
+        if end_time > control_horizon_hours + 1e-9:
+            raise ValueError(
+                f"ScheduledAction start_time_hours={action.start_time_hours}, "
+                f"duration_minutes={action.duration_minutes} would end at "
+                f"{end_time} h, past the control horizon "
+                f"{control_horizon_hours} h."
+            )
+
+    objective_name = (
+        "minimum ventilation energy under risk limit (scheduled)"
+    )
+
+    # Baseline (do-nothing) trajectory over the horizon. Every
+    # result reports this so the counterfactual is visible.
+    baseline_trajectory = _simulate_scheduled_action(
+        room=room,
+        thermal_properties=thermal_properties,
+        forecast=forecast,
+        moisture_schedule=moisture_schedule,
+        action=ScheduledAction(start_time_hours=0.0, duration_minutes=0.0),
+        control_horizon_hours=control_horizon_hours,
+        trajectory_timestep_minutes=trajectory_timestep_minutes,
+    )
+    baseline_risk = evaluate_moisture_risk(
+        trajectory=baseline_trajectory,
+        surface=surface,
+        config=risk_config,
+    )
+    zero_risk = evaluate_moisture_risk(
+        trajectory=_slice_trajectory(baseline_trajectory, 0.0),
+        surface=surface,
+        config=risk_config,
+    )
+
+    if constraints.max_cumulative_risk_score is None:
+        return ScheduledActionResult(
+            selected_action=ScheduledAction(0.0, 0.0),
+            baseline_risk=baseline_risk,
+            selected_risk=baseline_risk,
+            pre_action_risk=zero_risk,
+            energy_penalty_kwh=float("nan"),
+            final_indoor_temperature_c=baseline_trajectory.indoor_temperature_c[-1],
+            final_indoor_absolute_humidity_g_m3=(
+                baseline_trajectory.indoor_absolute_humidity_g_m3[-1]
+            ),
+            final_indoor_relative_humidity_pct=(
+                baseline_trajectory.indoor_relative_humidity_pct[-1]
+            ),
+            objective_name=objective_name,
+            feasible=False,
+            reason=(
+                "no max_cumulative_risk_score configured; this strategy "
+                "minimises ventilation energy subject to a caller-set risk "
+                "ceiling and requires the ceiling to be set."
+            ),
+        )
+
+    risk_ceiling = constraints.max_cumulative_risk_score
+    comfort_only_constraints = VentilationConstraints(
+        max_temperature_drop_c=constraints.max_temperature_drop_c,
+        max_energy_loss_kwh=constraints.max_energy_loss_kwh,
+    )
+
+    # Evaluate each candidate.
+    per_candidate: List[dict] = []
+    for action in candidate_actions:
+        if action.is_do_nothing:
+            trajectory = baseline_trajectory
+            risk = baseline_risk
+            pre_risk = zero_risk
+        else:
+            trajectory = _simulate_scheduled_action(
+                room=room,
+                thermal_properties=thermal_properties,
+                forecast=forecast,
+                moisture_schedule=moisture_schedule,
+                action=action,
+                control_horizon_hours=control_horizon_hours,
+                trajectory_timestep_minutes=trajectory_timestep_minutes,
+            )
+            risk = evaluate_moisture_risk(
+                trajectory=trajectory,
+                surface=surface,
+                config=risk_config,
+            )
+            if action.start_time_hours > 0.0:
+                pre_slice = _slice_trajectory(
+                    trajectory, action.start_time_hours
+                )
+                pre_risk = evaluate_moisture_risk(
+                    trajectory=pre_slice,
+                    surface=surface,
+                    config=risk_config,
+                )
+            else:
+                pre_risk = zero_risk
+
+        # Comfort feasibility applies to the ventilation event, so
+        # simulate the single event under the outdoor state that
+        # will be current at the START of the event. This mirrors
+        # the single-event comfort check the other risk-constrained
+        # strategy uses; it is a proxy that ignores the outdoor
+        # trend across the window (window durations are minutes,
+        # while forecast intervals here are hours).
+        if action.is_do_nothing:
+            comfort_ok = True
+            comfort_violations: Tuple[str, ...] = ()
+            event_prediction: Optional[VentilationSimulationResult] = None
+        else:
+            outdoor_at_start = forecast.sample_at(action.start_time_hours)
+            # Use the indoor T / RH at the sample nearest to the
+            # start of the event, so the comfort check reflects the
+            # ROOM's state at the moment of ventilation, not at t=0.
+            start_idx = _index_at_or_before(
+                trajectory.times_hours, action.start_time_hours
+            )
+            indoor_t_at_start = trajectory.indoor_temperature_c[start_idx]
+            indoor_rh_at_start = trajectory.indoor_relative_humidity_pct[
+                start_idx
+            ]
+            event_prediction = simulate_ventilation_event(
+                room_volume_m3=room.volume_m3,
+                initial_indoor_temperature_c=indoor_t_at_start,
+                initial_indoor_relative_humidity_pct=min(
+                    100.0, max(0.0, indoor_rh_at_start)
+                ),
+                outdoor_temperature_c=outdoor_at_start.temperature_c,
+                outdoor_relative_humidity_pct=(
+                    outdoor_at_start.relative_humidity_percent
+                ),
+                ach=room.ach_window_open,
+                effective_thermal_capacity_j_per_k=(
+                    thermal_properties.effective_thermal_capacity_j_per_k
+                ),
+                duration_minutes=action.duration_minutes,
+            )
+            comfort_violations = _check_feasibility(
+                event_prediction, comfort_only_constraints
+            )
+            comfort_ok = len(comfort_violations) == 0
+
+        risk_ok = risk.cumulative_risk_score <= risk_ceiling
+        pre_risk_ok = pre_risk.cumulative_risk_score <= risk_ceiling
+        # Energy penalty = the ventilation-event energy predicted by
+        # the single-event simulator (which already owns the physics).
+        # Do-nothing carries zero penalty by definition.
+        if event_prediction is None:
+            energy_kwh = 0.0
+        else:
+            energy_kwh = event_prediction.ventilation_energy_removed_kwh
+
+        per_candidate.append(
+            {
+                "action": action,
+                "trajectory": trajectory,
+                "risk": risk,
+                "pre_risk": pre_risk,
+                "risk_ok": risk_ok,
+                "pre_risk_ok": pre_risk_ok,
+                "comfort_ok": comfort_ok,
+                "comfort_violations": comfort_violations,
+                "energy_kwh": energy_kwh,
+                "event_prediction": event_prediction,
+            }
+        )
+
+    feasible = [
+        row
+        for row in per_candidate
+        if row["risk_ok"] and row["pre_risk_ok"] and row["comfort_ok"]
+    ]
+
+    if not feasible:
+        return _scheduled_action_failure(
+            per_candidate=per_candidate,
+            baseline_risk=baseline_risk,
+            zero_risk=zero_risk,
+            baseline_trajectory=baseline_trajectory,
+            risk_ceiling=risk_ceiling,
+            objective_name=objective_name,
+        )
+
+    winner = min(
+        feasible,
+        key=lambda row: (
+            _energy_tie_bucket(row["energy_kwh"]),
+            row["action"].start_time_hours,
+            row["action"].duration_minutes,
+        ),
+    )
+
+    action = winner["action"]
+    trajectory = winner["trajectory"]
+    if action.is_do_nothing:
+        reason = (
+            "predicted baseline cumulative risk score "
+            f"{baseline_risk.cumulative_risk_score:.4f} is already at or "
+            f"below the ceiling {risk_ceiling:g}; do-nothing is the "
+            "lowest-energy feasible action over this control horizon."
+        )
+    else:
+        wait_note = (
+            f"after waiting {action.start_time_hours:g} h "
+            if action.start_time_hours > 0.0
+            else "immediately "
+        )
+        reason = (
+            f"ventilating {wait_note}for {action.duration_minutes:g} min "
+            f"is the lowest-energy candidate whose predicted cumulative "
+            f"risk score {winner['risk'].cumulative_risk_score:.4f} stays "
+            f"at or below the ceiling {risk_ceiling:g} (baseline without "
+            f"action would have been "
+            f"{baseline_risk.cumulative_risk_score:.4f}). Energy penalty "
+            f"{winner['energy_kwh']:.4f} kWh; ties broken by earliest "
+            "start, then shortest duration."
+        )
+
+    return ScheduledActionResult(
+        selected_action=action,
+        baseline_risk=baseline_risk,
+        selected_risk=winner["risk"],
+        pre_action_risk=winner["pre_risk"],
+        energy_penalty_kwh=winner["energy_kwh"],
+        final_indoor_temperature_c=trajectory.indoor_temperature_c[-1],
+        final_indoor_absolute_humidity_g_m3=(
+            trajectory.indoor_absolute_humidity_g_m3[-1]
+        ),
+        final_indoor_relative_humidity_pct=(
+            trajectory.indoor_relative_humidity_pct[-1]
+        ),
+        objective_name=objective_name,
+        feasible=True,
+        reason=reason,
+    )
+
+
+def _index_at_or_before(times_hours: Tuple[float, ...], t: float) -> int:
+    """Largest i such that times_hours[i] <= t (linear scan; POC-sized N)."""
+    idx = 0
+    for i, ti in enumerate(times_hours):
+        if ti <= t:
+            idx = i
+        else:
+            break
+    return idx
+
+
+def _scheduled_action_failure(
+    per_candidate: List[dict],
+    baseline_risk: MoistureRiskState,
+    zero_risk: MoistureRiskState,
+    baseline_trajectory: RoomTrajectory,
+    risk_ceiling: float,
+    objective_name: str,
+) -> ScheduledActionResult:
+    """Compose an infeasible result naming the tightest unmet constraint.
+
+    Diagnosis priority:
+        1. If any candidate cleared comfort but was rejected because
+           its pre-vent risk exceeded the ceiling, name the "waiting
+           breaches the ceiling" case explicitly - this is the whole
+           point of the pre-vent risk guard.
+        2. If any candidate cleared comfort but its full-horizon
+           risk exceeded the ceiling, name the "no schedule can
+           keep the horizon within the ceiling" case.
+        3. Otherwise, the comfort constraints eliminated every
+           candidate; name the comfort violations of the last
+           candidate for audit.
+    """
+    comfort_survivors = [row for row in per_candidate if row["comfort_ok"]]
+
+    if comfort_survivors and any(not row["pre_risk_ok"] for row in comfort_survivors):
+        row = min(
+            (row for row in comfort_survivors if not row["pre_risk_ok"]),
+            key=lambda r: r["pre_risk"].cumulative_risk_score,
+        )
+        return ScheduledActionResult(
+            selected_action=row["action"],
+            baseline_risk=baseline_risk,
+            selected_risk=row["risk"],
+            pre_action_risk=row["pre_risk"],
+            energy_penalty_kwh=float("nan"),
+            final_indoor_temperature_c=(
+                row["trajectory"].indoor_temperature_c[-1]
+            ),
+            final_indoor_absolute_humidity_g_m3=(
+                row["trajectory"].indoor_absolute_humidity_g_m3[-1]
+            ),
+            final_indoor_relative_humidity_pct=(
+                row["trajectory"].indoor_relative_humidity_pct[-1]
+            ),
+            objective_name=objective_name,
+            feasible=False,
+            reason=(
+                "no candidate is feasible: waiting until the proposed "
+                "start time would itself breach the risk ceiling "
+                f"{risk_ceiling:g}. Closest candidate (start "
+                f"{row['action'].start_time_hours:g} h, "
+                f"{row['action'].duration_minutes:g} min) accumulated "
+                f"pre-vent risk {row['pre_risk'].cumulative_risk_score:.4f} "
+                "before the window opened."
+            ),
+        )
+    if comfort_survivors:
+        row = min(
+            comfort_survivors,
+            key=lambda r: r["risk"].cumulative_risk_score,
+        )
+        return ScheduledActionResult(
+            selected_action=row["action"],
+            baseline_risk=baseline_risk,
+            selected_risk=row["risk"],
+            pre_action_risk=row["pre_risk"],
+            energy_penalty_kwh=float("nan"),
+            final_indoor_temperature_c=(
+                row["trajectory"].indoor_temperature_c[-1]
+            ),
+            final_indoor_absolute_humidity_g_m3=(
+                row["trajectory"].indoor_absolute_humidity_g_m3[-1]
+            ),
+            final_indoor_relative_humidity_pct=(
+                row["trajectory"].indoor_relative_humidity_pct[-1]
+            ),
+            objective_name=objective_name,
+            feasible=False,
+            reason=(
+                "no candidate keeps the predicted cumulative risk score "
+                f"at or below {risk_ceiling:g}; the lowest-risk candidate "
+                f"satisfying comfort was start "
+                f"{row['action'].start_time_hours:g} h for "
+                f"{row['action'].duration_minutes:g} min with predicted "
+                f"score {row['risk'].cumulative_risk_score:.4f} "
+                f"(baseline {baseline_risk.cumulative_risk_score:.4f})."
+            ),
+        )
+    # No candidate cleared comfort.
+    row = per_candidate[-1]
+    return ScheduledActionResult(
+        selected_action=row["action"],
+        baseline_risk=baseline_risk,
+        selected_risk=row["risk"],
+        pre_action_risk=row["pre_risk"],
+        energy_penalty_kwh=float("nan"),
+        final_indoor_temperature_c=(
+            row["trajectory"].indoor_temperature_c[-1]
+        ),
+        final_indoor_absolute_humidity_g_m3=(
+            row["trajectory"].indoor_absolute_humidity_g_m3[-1]
+        ),
+        final_indoor_relative_humidity_pct=(
+            row["trajectory"].indoor_relative_humidity_pct[-1]
+        ),
+        objective_name=objective_name,
+        feasible=False,
+        reason=(
+            "no candidate satisfies the comfort constraints "
+            f"({', '.join(row['comfort_violations']) or 'unspecified'})."
+        ),
     )
 
 

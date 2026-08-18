@@ -43,6 +43,7 @@ from psychrometrics import (
     relative_humidity_from_absolute_humidity,
 )
 from thermal import ThermalProperties, predict_indoor_temperature
+from weather_forecast import WeatherForecast
 
 
 @dataclass(frozen=True)
@@ -287,6 +288,148 @@ def simulate_room_period(
         generation_rates.append(generation_g_per_hour)
 
         # Advance state.
+        indoor_ah = next_indoor_ah
+        indoor_t = next_indoor_t
+
+    return RoomTrajectory(
+        times_hours=tuple(times),
+        indoor_temperature_c=tuple(indoor_temperatures),
+        indoor_absolute_humidity_g_m3=tuple(indoor_ahs),
+        indoor_relative_humidity_pct=tuple(indoor_rhs),
+        outdoor_temperature_c=tuple(outdoor_ts),
+        outdoor_absolute_humidity_g_m3=tuple(outdoor_ahs),
+        window_open=tuple(window_states),
+        moisture_generation_g_per_hour=tuple(generation_rates),
+    )
+
+
+def simulate_room_period_with_forecast(
+    room: Room,
+    thermal_properties: ThermalProperties,
+    forecast: WeatherForecast,
+    moisture_schedule: MoistureSourceSchedule,
+    ventilation_events: Sequence[VentilationEvent],
+    duration_hours: float,
+    timestep_minutes: float,
+) -> RoomTrajectory:
+    """Simulate a room over a horizon with time-varying outdoor conditions.
+
+    Structurally identical to ``simulate_room_period`` except the
+    outdoor state is looked up on the ``WeatherForecast`` at the
+    START of every step (piecewise-constant across the step),
+    matching the same convention the schedule and window lookups
+    already use. No new physics: outdoor T and outdoor AH per step
+    feed into the same simulator calls that the constant-outdoor
+    routine drives.
+
+    Args:
+        room, thermal_properties, moisture_schedule,
+        ventilation_events, duration_hours, timestep_minutes: same as
+            ``simulate_room_period``.
+        forecast: outdoor forecast. Query times outside its
+            [first_ts, last_ts] range hold the nearest endpoint (see
+            ``weather_forecast`` module docstring).
+
+    Returns:
+        A ``RoomTrajectory`` with one entry per step boundary.
+
+    Raises:
+        ValueError: on any invalid input; validation errors from
+            the underlying simulator propagate.
+    """
+    if not isfinite(duration_hours):
+        raise ValueError(
+            f"duration_hours must be finite, got {duration_hours!r}"
+        )
+    if duration_hours < 0.0:
+        raise ValueError(
+            f"duration_hours must be non-negative, got {duration_hours}"
+        )
+    if not isfinite(timestep_minutes):
+        raise ValueError(
+            f"timestep_minutes must be finite, got {timestep_minutes!r}"
+        )
+    if timestep_minutes <= 0.0:
+        raise ValueError(
+            f"timestep_minutes must be strictly positive, got {timestep_minutes}"
+        )
+
+    step_hours = timestep_minutes / MINUTES_PER_HOUR
+    if duration_hours == 0.0:
+        step_count = 0
+    else:
+        step_count = int(duration_hours / step_hours + 1e-9)
+
+    initial_air_state = AirState(
+        temperature_c=room.indoor_temperature_c,
+        relative_humidity_percent=room.indoor_relative_humidity_pct,
+    )
+    indoor_ah = initial_air_state.absolute_humidity
+    indoor_t = room.indoor_temperature_c
+
+    outdoor_at_zero = forecast.sample_at(0.0)
+    times: List[float] = [0.0]
+    indoor_temperatures: List[float] = [indoor_t]
+    indoor_ahs: List[float] = [indoor_ah]
+    indoor_rhs: List[float] = [room.indoor_relative_humidity_pct]
+    outdoor_ts: List[float] = [outdoor_at_zero.temperature_c]
+    outdoor_ahs: List[float] = [outdoor_at_zero.absolute_humidity]
+    window_states: List[bool] = [_is_window_open_at(ventilation_events, 0.0)]
+    generation_rates: List[float] = [
+        moisture_generation_rate_g_per_hour_at(moisture_schedule, 0.0)
+    ]
+
+    for step_index in range(step_count):
+        time_now_hours = step_index * step_hours
+
+        window_is_open = _is_window_open_at(
+            ventilation_events, time_now_hours
+        )
+        ach = (
+            room.ach_window_open if window_is_open else room.ach_closed
+        )
+        generation_g_per_hour = moisture_generation_rate_g_per_hour_at(
+            moisture_schedule, time_now_hours
+        )
+        outdoor_now = forecast.sample_at(time_now_hours)
+        outdoor_ah_now = outdoor_now.absolute_humidity
+
+        next_indoor_ah = predict_final_absolute_humidity(
+            indoor_ah_g_m3=indoor_ah,
+            outdoor_ah_g_m3=outdoor_ah_now,
+            ach=ach,
+            duration_minutes=timestep_minutes,
+        )
+        next_indoor_ah = next_indoor_ah + (
+            generation_g_per_hour * step_hours / room.volume_m3
+        )
+
+        next_indoor_t = predict_indoor_temperature(
+            initial_indoor_temperature_c=indoor_t,
+            outdoor_temperature_c=outdoor_now.temperature_c,
+            room_volume_m3=room.volume_m3,
+            ach=ach,
+            effective_thermal_capacity_j_per_k=(
+                thermal_properties.effective_thermal_capacity_j_per_k
+            ),
+            duration_minutes=timestep_minutes,
+        )
+
+        next_indoor_rh = relative_humidity_from_absolute_humidity(
+            temperature_c=next_indoor_t,
+            absolute_humidity_g_m3=next_indoor_ah,
+        )
+
+        step_end_hours = (step_index + 1) * step_hours
+        times.append(step_end_hours)
+        indoor_temperatures.append(next_indoor_t)
+        indoor_ahs.append(next_indoor_ah)
+        indoor_rhs.append(next_indoor_rh)
+        outdoor_ts.append(outdoor_now.temperature_c)
+        outdoor_ahs.append(outdoor_ah_now)
+        window_states.append(window_is_open)
+        generation_rates.append(generation_g_per_hour)
+
         indoor_ah = next_indoor_ah
         indoor_t = next_indoor_t
 

@@ -33,7 +33,9 @@ from time_simulation import (
     RoomTrajectory,
     VentilationEvent,
     simulate_room_period,
+    simulate_room_period_with_forecast,
 )
+from weather_forecast import ForecastPoint, WeatherForecast
 
 
 def _default_room() -> Room:
@@ -451,3 +453,102 @@ def test_ventilation_event_rejects_zero_width_interval() -> None:
         VentilationEvent(start_time_hours=0.5, end_time_hours=0.5)
     with pytest.raises(ValueError, match="end_time_hours"):
         VentilationEvent(start_time_hours=1.0, end_time_hours=0.5)
+
+
+# --- Forecast-aware simulation --------------------------------------------
+
+
+def test_forecast_variant_matches_constant_outdoor_when_forecast_is_flat() -> None:
+    """A single-point forecast is equivalent to a constant outdoor state.
+
+    The two functions are structurally identical except that the
+    forecast variant looks up outdoor T / RH at every step. When the
+    forecast is a single ``ForecastPoint`` (or every point identical),
+    both should produce sample-for-sample equal trajectories.
+    """
+    room = _default_room()
+    thermal = _default_thermal_properties()
+    outdoor = _default_outdoor()
+    forecast = WeatherForecast(
+        points=(
+            ForecastPoint(
+                timestamp_hours=0.0,
+                temperature_c=outdoor.temperature_c,
+                relative_humidity_percent=outdoor.relative_humidity_percent,
+            ),
+        )
+    )
+    schedule = MoistureSourceSchedule(
+        constant_background_rate_g_per_hour=50.0
+    )
+    events = (VentilationEvent(start_time_hours=0.5, end_time_hours=0.7),)
+    duration_hours = 2.0
+    timestep_minutes = 5.0
+    trajectory_constant = simulate_room_period(
+        room=room,
+        thermal_properties=thermal,
+        outdoor=outdoor,
+        moisture_schedule=schedule,
+        ventilation_events=events,
+        duration_hours=duration_hours,
+        timestep_minutes=timestep_minutes,
+    )
+    trajectory_forecast = simulate_room_period_with_forecast(
+        room=room,
+        thermal_properties=thermal,
+        forecast=forecast,
+        moisture_schedule=schedule,
+        ventilation_events=events,
+        duration_hours=duration_hours,
+        timestep_minutes=timestep_minutes,
+    )
+    for i in range(len(trajectory_constant.times_hours)):
+        assert trajectory_forecast.indoor_temperature_c[i] == pytest.approx(
+            trajectory_constant.indoor_temperature_c[i], rel=1e-9
+        )
+        assert (
+            trajectory_forecast.indoor_absolute_humidity_g_m3[i]
+            == pytest.approx(
+                trajectory_constant.indoor_absolute_humidity_g_m3[i],
+                rel=1e-9,
+            )
+        )
+
+
+def test_forecast_variant_tracks_time_varying_outdoor_temperature() -> None:
+    """Changing forecast T drives changing outdoor T in the trajectory.
+
+    Recording semantics: ``outdoor_temperature_c[i]`` stores the
+    outdoor value that was in effect at the START of the step ending
+    at ``times_hours[i]`` (or at t = 0.0 for the first sample). At
+    least one sample must fall inside each forecast segment for this
+    check to be meaningful.
+    """
+    forecast = WeatherForecast(
+        points=(
+            ForecastPoint(0.0, -2.0, 70.0),
+            ForecastPoint(1.0, 8.0, 60.0),
+            ForecastPoint(2.0, 12.0, 55.0),
+        )
+    )
+    trajectory = simulate_room_period_with_forecast(
+        room=_default_room(),
+        thermal_properties=_default_thermal_properties(),
+        forecast=forecast,
+        moisture_schedule=MoistureSourceSchedule(),
+        ventilation_events=(),
+        duration_hours=3.0,
+        timestep_minutes=15.0,
+    )
+    # Sample the middle of each forecast segment for a clean check.
+    def outdoor_at(query_hours: float) -> float:
+        # linear scan on the (small) times list.
+        best_i = 0
+        for i, t in enumerate(trajectory.times_hours):
+            if t <= query_hours + 1e-9:
+                best_i = i
+        return trajectory.outdoor_temperature_c[best_i]
+
+    assert outdoor_at(0.5) == pytest.approx(-2.0)
+    assert outdoor_at(1.5) == pytest.approx(8.0)
+    assert outdoor_at(2.5) == pytest.approx(12.0)
