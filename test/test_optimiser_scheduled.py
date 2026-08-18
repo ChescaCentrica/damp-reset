@@ -179,8 +179,10 @@ def test_result_is_frozen_and_exposes_named_fields() -> None:
 def test_do_nothing_wins_when_baseline_already_below_ceiling() -> None:
     """A loose ceiling that the baseline already meets -> 0-min action wins.
 
-    Do-nothing has zero ventilation energy and satisfies every
-    non-risk constraint, so no other candidate can beat it on energy
+    Do-nothing has the LOWEST ventilation heat removed of any
+    feasible candidate: the room only leaks through ach_closed, not
+    through an open window. Any non-zero-duration candidate loses
+    strictly more heat, so no other candidate can beat do-nothing
     when the ceiling accepts the baseline.
     """
     result = optimise_scheduled_action_under_risk_limit(
@@ -205,7 +207,12 @@ def test_do_nothing_wins_when_baseline_already_below_ceiling() -> None:
     )
     assert result.feasible
     assert result.selected_action.is_do_nothing
-    assert result.energy_penalty_kwh == 0.0
+    # Do-nothing accrues only closed-window background loss; it does
+    # not accrue zero unless ach_closed is zero. Under NoHeating, no
+    # heat is supplied to compensate.
+    assert result.energy_penalty_kwh >= 0.0
+    assert result.heating_thermal_energy_supplied_kwh == 0.0
+    assert result.heating_input_energy_purchased_kwh == 0.0
     assert result.pre_action_risk.cumulative_risk_score == 0.0
 
 
@@ -303,9 +310,21 @@ def test_pre_action_risk_is_at_or_below_ceiling_when_feasible() -> None:
     assert result.pre_action_risk.cumulative_risk_score <= 2.0 + 1e-9
 
 
-def test_energy_penalty_matches_single_event_simulator_when_ventilating() -> None:
-    """The reported energy penalty equals the simulator's energy for the event."""
-    from ventilation import simulate_ventilation_event
+def test_energy_penalty_matches_heating_aware_resimulation() -> None:
+    """The reported energy penalty equals the heating-aware simulator's total.
+
+    After the "heating-aware optimiser" refactor, the optimiser
+    plans on the same trajectory type a caller obtains from
+    ``simulate_room_period_with_heating``. The
+    ``energy_penalty_kwh`` field is defined as the
+    ``ventilation_heat_removed_kwh`` of that trajectory - and this
+    test proves the optimiser has NOT invented its own number.
+    """
+    from heating import NoHeating
+    from time_simulation import (
+        VentilationEvent as _VentEvent,
+        simulate_room_period_with_heating,
+    )
 
     result = optimise_scheduled_action_under_risk_limit(
         room=_room(),
@@ -323,22 +342,21 @@ def test_energy_penalty_matches_single_event_simulator_when_ventilating() -> Non
     )
     assert result.feasible
     assert not result.selected_action.is_do_nothing
-    # For an immediate event, the simulator's energy uses the t=0
-    # outdoor state and the ROOM's t=0 state; compare directly.
-    expected = simulate_ventilation_event(
-        room_volume_m3=40.0,
-        initial_indoor_temperature_c=20.0,
-        initial_indoor_relative_humidity_pct=70.0,
-        outdoor_temperature_c=-2.0,
-        outdoor_relative_humidity_pct=70.0,
-        ach=5.0,
-        effective_thermal_capacity_j_per_k=(
-            ILLUSTRATIVE_EFFECTIVE_THERMAL_CAPACITY_J_PER_K
+
+    resim = simulate_room_period_with_heating(
+        room=_room(),
+        thermal_properties=_thermal(),
+        forecast=_cold_now_mild_later(),
+        moisture_schedule=_mild_schedule(),
+        ventilation_events=(
+            _VentEvent(start_time_hours=0.0, end_time_hours=10.0 / 60.0),
         ),
-        duration_minutes=10.0,
+        heating_model=NoHeating(),
+        duration_hours=6.0,
+        timestep_minutes=5.0,
     )
     assert result.energy_penalty_kwh == pytest.approx(
-        expected.ventilation_energy_removed_kwh, rel=1e-9
+        resim.ventilation_heat_removed_kwh, rel=1e-9
     )
 
 

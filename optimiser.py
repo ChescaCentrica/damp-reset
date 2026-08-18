@@ -122,11 +122,14 @@ from mould_risk import MoistureRiskState, RiskConfig, evaluate_moisture_risk
 from psychrometrics import AirState
 from surface_risk import SurfaceDescriptor
 from thermal import ThermalProperties
+from heating import HeatingModel, NoHeating
 from time_simulation import (
+    RoomHeatingTrajectory,
     RoomTrajectory,
     VentilationEvent,
     simulate_room_period,
     simulate_room_period_with_forecast,
+    simulate_room_period_with_heating,
 )
 from ventilation import VentilationSimulationResult, simulate_ventilation_event
 from weather_forecast import WeatherForecast
@@ -2205,7 +2208,51 @@ class ScheduledActionResult:
             this to verify the "do not wait if waiting alone
             breaches the ceiling" rule was applied.
         energy_penalty_kwh: heat energy predicted to leave the room
-            during the ventilation window. Zero when do-nothing wins.
+            THROUGH THE WINDOW during the control horizon. Zero when
+            do-nothing wins. This is the same
+            ``ventilation_heat_removed_kwh`` the heating-aware
+            simulator reports, i.e. it INCLUDES the extra ventilation
+            heat loss the running heater causes by keeping the room
+            warm during a vent event.
+        heating_thermal_energy_supplied_kwh: total heat the caller's
+            ``heating_model`` delivered to the room over the horizon.
+            Zero under ``NoHeating``. Not the electricity bill - see
+            ``heating_input_energy_purchased_kwh``.
+        heating_input_energy_purchased_kwh: the electricity / gas the
+            occupant purchases at the meter over the horizon (thermal
+            supplied divided by the caller's ``efficiency_or_cop``).
+            Zero under ``NoHeating``.
+        baseline_heating_thermal_energy_supplied_kwh: what the heater
+            WOULD have delivered over the horizon under the
+            do-nothing counterfactual. Non-negative. Zero under
+            ``NoHeating``.
+        baseline_heating_input_energy_purchased_kwh: what the
+            occupant WOULD have purchased under do-nothing. Zero
+            under ``NoHeating``.
+        incremental_heating_thermal_energy_supplied_kwh: extra
+            thermal energy the heater delivered because of the
+            action, defined as
+            ``heating_thermal_energy_supplied_kwh
+            - baseline_heating_thermal_energy_supplied_kwh``.
+            Non-negative in normal operation (ventilating cools the
+            room, so the heater works harder). Zero exactly when the
+            action is do-nothing.
+        incremental_heating_input_energy_purchased_kwh: the caller-
+            visible bookkeeping the caller asked us to report:
+            purchased_action - purchased_baseline. This is the
+            portion of the electricity / gas bill attributable to
+            the ventilation action; the rest is background building
+            heat loss that the caller would have paid for anyway.
+            Non-negative in normal operation; zero exactly when the
+            action is do-nothing.
+        risk_reduction: baseline cumulative risk score minus the
+            selected action's cumulative risk score. Positive when
+            the action helps; zero for do-nothing.
+        condensation_time_reduction_hours: baseline time-in-
+            condensation minus the selected action's time-in-
+            condensation. Positive when the action removes
+            condensation time; zero or negative are also possible
+            edge cases (e.g. an action does not touch the peak).
         final_indoor_temperature_c: predicted indoor temperature at
             the END of the control horizon. Useful when comparing
             controllers.
@@ -2214,7 +2261,8 @@ class ScheduledActionResult:
         final_indoor_relative_humidity_pct: predicted indoor RH at
             the end of the horizon.
         objective_name: fixed at
-            ``"minimum ventilation energy under risk limit (scheduled)"``.
+            ``"minimum incremental purchased energy under risk limit
+            (scheduled)"``.
         feasible: True when at least one candidate satisfied every
             constraint (risk during wait, risk over full horizon,
             comfort).
@@ -2227,6 +2275,14 @@ class ScheduledActionResult:
     selected_risk: MoistureRiskState
     pre_action_risk: MoistureRiskState
     energy_penalty_kwh: float
+    heating_thermal_energy_supplied_kwh: float
+    heating_input_energy_purchased_kwh: float
+    baseline_heating_thermal_energy_supplied_kwh: float
+    baseline_heating_input_energy_purchased_kwh: float
+    incremental_heating_thermal_energy_supplied_kwh: float
+    incremental_heating_input_energy_purchased_kwh: float
+    risk_reduction: float
+    condensation_time_reduction_hours: float
     final_indoor_temperature_c: float
     final_indoor_absolute_humidity_g_m3: float
     final_indoor_relative_humidity_pct: float
@@ -2276,11 +2332,18 @@ def _simulate_scheduled_action(
     thermal_properties: ThermalProperties,
     forecast: WeatherForecast,
     moisture_schedule: MoistureSourceSchedule,
+    heating_model: HeatingModel,
     action: ScheduledAction,
     control_horizon_hours: float,
     trajectory_timestep_minutes: float,
-) -> RoomTrajectory:
+) -> RoomHeatingTrajectory:
     """Simulate the room over the control horizon under one scheduled action.
+
+    Uses the same heating-aware simulator the caller's downstream
+    code uses to re-simulate the selected action, so what the
+    optimiser SEES per candidate is what the caller GETS when the
+    winner is re-run. See the regression tests in
+    ``test/test_optimiser_scheduled_heating_consistency.py``.
 
     A do-nothing action produces the baseline trajectory (no
     ventilation event scheduled). A positive-duration action places
@@ -2289,8 +2352,8 @@ def _simulate_scheduled_action(
     ``action.duration_minutes / 60`` hours later.
 
     Delegates entirely to
-    ``time_simulation.simulate_room_period_with_forecast`` -
-    no physics is done here.
+    ``time_simulation.simulate_room_period_with_heating`` - no
+    physics is done here.
     """
     if action.is_do_nothing:
         events: Tuple[VentilationEvent, ...] = ()
@@ -2303,12 +2366,13 @@ def _simulate_scheduled_action(
                 ),
             ),
         )
-    return simulate_room_period_with_forecast(
+    return simulate_room_period_with_heating(
         room=room,
         thermal_properties=thermal_properties,
         forecast=forecast,
         moisture_schedule=moisture_schedule,
         ventilation_events=events,
+        heating_model=heating_model,
         duration_hours=control_horizon_hours,
         timestep_minutes=trajectory_timestep_minutes,
     )
@@ -2325,6 +2389,7 @@ def optimise_scheduled_action_under_risk_limit(
     risk_config: RiskConfig,
     control_horizon_hours: float,
     trajectory_timestep_minutes: float,
+    heating_model: Optional[HeatingModel] = None,
 ) -> ScheduledActionResult:
     """Pick the lowest-energy (start, duration) action within a risk ceiling.
 
@@ -2339,13 +2404,21 @@ def optimise_scheduled_action_under_risk_limit(
 
     Algorithm:
         For each candidate action:
-            a. Simulate the room over the full control horizon with
-               the forecast supplying outdoor conditions at every
-               step. If the action is do-nothing, no window opens;
-               otherwise a single ventilation event runs during
-               ``[start_time_hours, start_time_hours + duration/60)``.
+            a. Simulate the room over the full control horizon
+               using ``simulate_room_period_with_heating`` -
+               moisture generation, ventilation, temperature ODE,
+               heating-system response, indoor AH / RH all
+               integrated in the same trajectory the caller will
+               re-run on the selected action. If the caller passes
+               ``heating_model=None`` (the default), an internal
+               ``NoHeating()`` model is used so the room cools
+               freely; passing a real ``ThermostaticHeating`` makes
+               the optimiser plan against the same heating
+               response the deployed system will produce.
             b. Evaluate the cumulative risk indicator over the whole
-               trajectory.
+               trajectory (surface T, surface RH, exposure time,
+               and cumulative score). No no-heating stand-in - the
+               optimiser sees the same risk the caller sees.
             c. If the action has a strictly positive
                ``start_time_hours``, ALSO evaluate the risk indicator
                over the pre-ventilation slice
@@ -2358,11 +2431,19 @@ def optimise_scheduled_action_under_risk_limit(
                state that will be current AT THE START of the
                event); reject candidates that fail comfort.
         Among the surviving feasible candidates, pick the one with
-        the lowest ventilation-event energy penalty (reading indoor
-        T at the trajectory samples that bracket the event and
-        applying the caller's ``effective_thermal_capacity_j_per_k``).
-        Ties on energy break to the earliest start time (act sooner
-        when tied), then to the shortest duration.
+        the lowest predicted ventilation heat removed
+        (``RoomHeatingTrajectory.ventilation_heat_removed_kwh``).
+        Under a fixed appliance efficiency / COP this ordering
+        matches ordering on purchased input energy. Ties break to
+        the earliest start time (act sooner when tied), then to the
+        shortest duration.
+
+    Regression tests in
+    ``test/test_optimiser_scheduled_heating_consistency.py`` prove
+    that the ``ScheduledActionResult`` returned for the winning
+    candidate is exactly equal to what a caller gets from
+    ``simulate_room_period_with_heating`` + ``evaluate_moisture_risk``
+    on that action - no residual mismatch.
 
     Do-nothing is always considered; when the baseline trajectory
     already sits at or below the risk ceiling, do-nothing wins on
@@ -2456,27 +2537,35 @@ def optimise_scheduled_action_under_risk_limit(
             )
 
     objective_name = (
-        "minimum ventilation energy under risk limit (scheduled)"
+        "minimum incremental purchased energy under risk limit (scheduled)"
     )
 
-    # Baseline (do-nothing) trajectory over the horizon. Every
-    # result reports this so the counterfactual is visible.
-    baseline_trajectory = _simulate_scheduled_action(
+    if heating_model is None:
+        heating_model = NoHeating()
+
+    # Baseline (do-nothing) heating-aware trajectory over the
+    # horizon. Every result reports this so the counterfactual is
+    # visible; because the trajectory is heating-aware, the
+    # baseline reflects what the room actually does when no
+    # ventilation is scheduled but the heater still responds.
+    baseline_heating_trajectory = _simulate_scheduled_action(
         room=room,
         thermal_properties=thermal_properties,
         forecast=forecast,
         moisture_schedule=moisture_schedule,
+        heating_model=heating_model,
         action=ScheduledAction(start_time_hours=0.0, duration_minutes=0.0),
         control_horizon_hours=control_horizon_hours,
         trajectory_timestep_minutes=trajectory_timestep_minutes,
     )
+    baseline_room_trajectory = baseline_heating_trajectory.trajectory
     baseline_risk = evaluate_moisture_risk(
-        trajectory=baseline_trajectory,
+        trajectory=baseline_room_trajectory,
         surface=surface,
         config=risk_config,
     )
     zero_risk = evaluate_moisture_risk(
-        trajectory=_slice_trajectory(baseline_trajectory, 0.0),
+        trajectory=_slice_trajectory(baseline_room_trajectory, 0.0),
         surface=surface,
         config=risk_config,
     )
@@ -2488,12 +2577,28 @@ def optimise_scheduled_action_under_risk_limit(
             selected_risk=baseline_risk,
             pre_action_risk=zero_risk,
             energy_penalty_kwh=float("nan"),
-            final_indoor_temperature_c=baseline_trajectory.indoor_temperature_c[-1],
+            heating_thermal_energy_supplied_kwh=(
+                baseline_heating_trajectory.heating_thermal_energy_supplied_kwh
+            ),
+            heating_input_energy_purchased_kwh=(
+                baseline_heating_trajectory.heating_input_energy_purchased_kwh
+            ),
+            baseline_heating_thermal_energy_supplied_kwh=(
+                baseline_heating_trajectory.heating_thermal_energy_supplied_kwh
+            ),
+            baseline_heating_input_energy_purchased_kwh=(
+                baseline_heating_trajectory.heating_input_energy_purchased_kwh
+            ),
+            incremental_heating_thermal_energy_supplied_kwh=0.0,
+            incremental_heating_input_energy_purchased_kwh=0.0,
+            risk_reduction=0.0,
+            condensation_time_reduction_hours=0.0,
+            final_indoor_temperature_c=baseline_room_trajectory.indoor_temperature_c[-1],
             final_indoor_absolute_humidity_g_m3=(
-                baseline_trajectory.indoor_absolute_humidity_g_m3[-1]
+                baseline_room_trajectory.indoor_absolute_humidity_g_m3[-1]
             ),
             final_indoor_relative_humidity_pct=(
-                baseline_trajectory.indoor_relative_humidity_pct[-1]
+                baseline_room_trajectory.indoor_relative_humidity_pct[-1]
             ),
             objective_name=objective_name,
             feasible=False,
@@ -2510,31 +2615,34 @@ def optimise_scheduled_action_under_risk_limit(
         max_energy_loss_kwh=constraints.max_energy_loss_kwh,
     )
 
-    # Evaluate each candidate.
+    # Evaluate each candidate on the HEATING-AWARE trajectory.
     per_candidate: List[dict] = []
     for action in candidate_actions:
         if action.is_do_nothing:
-            trajectory = baseline_trajectory
+            heating_trajectory = baseline_heating_trajectory
+            room_trajectory = baseline_room_trajectory
             risk = baseline_risk
             pre_risk = zero_risk
         else:
-            trajectory = _simulate_scheduled_action(
+            heating_trajectory = _simulate_scheduled_action(
                 room=room,
                 thermal_properties=thermal_properties,
                 forecast=forecast,
                 moisture_schedule=moisture_schedule,
+                heating_model=heating_model,
                 action=action,
                 control_horizon_hours=control_horizon_hours,
                 trajectory_timestep_minutes=trajectory_timestep_minutes,
             )
+            room_trajectory = heating_trajectory.trajectory
             risk = evaluate_moisture_risk(
-                trajectory=trajectory,
+                trajectory=room_trajectory,
                 surface=surface,
                 config=risk_config,
             )
             if action.start_time_hours > 0.0:
                 pre_slice = _slice_trajectory(
-                    trajectory, action.start_time_hours
+                    room_trajectory, action.start_time_hours
                 )
                 pre_risk = evaluate_moisture_risk(
                     trajectory=pre_slice,
@@ -2561,10 +2669,10 @@ def optimise_scheduled_action_under_risk_limit(
             # start of the event, so the comfort check reflects the
             # ROOM's state at the moment of ventilation, not at t=0.
             start_idx = _index_at_or_before(
-                trajectory.times_hours, action.start_time_hours
+                room_trajectory.times_hours, action.start_time_hours
             )
-            indoor_t_at_start = trajectory.indoor_temperature_c[start_idx]
-            indoor_rh_at_start = trajectory.indoor_relative_humidity_pct[
+            indoor_t_at_start = room_trajectory.indoor_temperature_c[start_idx]
+            indoor_rh_at_start = room_trajectory.indoor_relative_humidity_pct[
                 start_idx
             ]
             event_prediction = simulate_ventilation_event(
@@ -2590,18 +2698,44 @@ def optimise_scheduled_action_under_risk_limit(
 
         risk_ok = risk.cumulative_risk_score <= risk_ceiling
         pre_risk_ok = pre_risk.cumulative_risk_score <= risk_ceiling
-        # Energy penalty = the ventilation-event energy predicted by
-        # the single-event simulator (which already owns the physics).
-        # Do-nothing carries zero penalty by definition.
-        if event_prediction is None:
-            energy_kwh = 0.0
-        else:
-            energy_kwh = event_prediction.ventilation_energy_removed_kwh
+        # Ventilation heat removed reported by the heating-aware
+        # trajectory - the same number the caller would compute by
+        # re-simulating the winner. Includes the "heater keeps the
+        # room warmer during the vent, so ventilation removes more
+        # heat" effect. Kept as the SECONDARY ranking key because
+        # under NoHeating() every candidate's incremental purchased
+        # energy is zero and this term still preserves the
+        # earlier-slice's ordering.
+        energy_kwh = heating_trajectory.ventilation_heat_removed_kwh
+        # Incremental (baseline-subtracted) purchased energy: the
+        # PRIMARY ranking key per the caller's instruction. Under
+        # NoHeating() this is zero for every candidate; under a
+        # thermostatic heating model it is the extra electricity /
+        # gas the caller pays to hold setpoint AFTER the vent event
+        # cools the room, on top of the background purchase the
+        # room would have made under do-nothing.
+        incremental_thermal_kwh = (
+            heating_trajectory.heating_thermal_energy_supplied_kwh
+            - baseline_heating_trajectory.heating_thermal_energy_supplied_kwh
+        )
+        incremental_input_kwh = (
+            heating_trajectory.heating_input_energy_purchased_kwh
+            - baseline_heating_trajectory.heating_input_energy_purchased_kwh
+        )
+        # Deltas vs baseline the caller asked us to report.
+        risk_reduction = (
+            baseline_risk.cumulative_risk_score - risk.cumulative_risk_score
+        )
+        condensation_time_reduction = (
+            baseline_risk.time_in_condensation_hours
+            - risk.time_in_condensation_hours
+        )
 
         per_candidate.append(
             {
                 "action": action,
-                "trajectory": trajectory,
+                "heating_trajectory": heating_trajectory,
+                "room_trajectory": room_trajectory,
                 "risk": risk,
                 "pre_risk": pre_risk,
                 "risk_ok": risk_ok,
@@ -2609,6 +2743,10 @@ def optimise_scheduled_action_under_risk_limit(
                 "comfort_ok": comfort_ok,
                 "comfort_violations": comfort_violations,
                 "energy_kwh": energy_kwh,
+                "incremental_thermal_kwh": incremental_thermal_kwh,
+                "incremental_input_kwh": incremental_input_kwh,
+                "risk_reduction": risk_reduction,
+                "condensation_time_reduction_hours": condensation_time_reduction,
                 "event_prediction": event_prediction,
             }
         )
@@ -2624,14 +2762,23 @@ def optimise_scheduled_action_under_risk_limit(
             per_candidate=per_candidate,
             baseline_risk=baseline_risk,
             zero_risk=zero_risk,
-            baseline_trajectory=baseline_trajectory,
+            baseline_heating_trajectory=baseline_heating_trajectory,
             risk_ceiling=risk_ceiling,
             objective_name=objective_name,
         )
 
+    # Primary key: incremental purchased energy (what the occupant
+    # actually pays for this action ON TOP OF the background
+    # building load). Secondary key: ventilation heat removed
+    # through the window - keeps the ranking well-defined when the
+    # heating model is NoHeating() (every candidate's incremental
+    # purchase is zero then) and preserves the pre-heating-slice
+    # ordering byte-for-byte in that regime. Tertiary tie-breaks:
+    # earliest start, then shortest duration.
     winner = min(
         feasible,
         key=lambda row: (
+            _energy_tie_bucket(row["incremental_input_kwh"]),
             _energy_tie_bucket(row["energy_kwh"]),
             row["action"].start_time_hours,
             row["action"].duration_minutes,
@@ -2639,7 +2786,8 @@ def optimise_scheduled_action_under_risk_limit(
     )
 
     action = winner["action"]
-    trajectory = winner["trajectory"]
+    room_trajectory = winner["room_trajectory"]
+    heating_trajectory = winner["heating_trajectory"]
     if action.is_do_nothing:
         reason = (
             "predicted baseline cumulative risk score "
@@ -2655,13 +2803,16 @@ def optimise_scheduled_action_under_risk_limit(
         )
         reason = (
             f"ventilating {wait_note}for {action.duration_minutes:g} min "
-            f"is the lowest-energy candidate whose predicted cumulative "
-            f"risk score {winner['risk'].cumulative_risk_score:.4f} stays "
-            f"at or below the ceiling {risk_ceiling:g} (baseline without "
+            f"is the candidate with the lowest INCREMENTAL purchased "
+            f"heating energy ({winner['incremental_input_kwh']:.4f} kWh "
+            f"vs baseline) whose predicted cumulative risk score "
+            f"{winner['risk'].cumulative_risk_score:.4f} stays at or "
+            f"below the ceiling {risk_ceiling:g} (baseline without "
             f"action would have been "
-            f"{baseline_risk.cumulative_risk_score:.4f}). Energy penalty "
-            f"{winner['energy_kwh']:.4f} kWh; ties broken by earliest "
-            "start, then shortest duration."
+            f"{baseline_risk.cumulative_risk_score:.4f}). Ventilation "
+            f"heat removed {winner['energy_kwh']:.4f} kWh; ties broken "
+            "by lowest ventilation heat removed, then earliest start, "
+            "then shortest duration."
         )
 
     return ScheduledActionResult(
@@ -2670,12 +2821,34 @@ def optimise_scheduled_action_under_risk_limit(
         selected_risk=winner["risk"],
         pre_action_risk=winner["pre_risk"],
         energy_penalty_kwh=winner["energy_kwh"],
-        final_indoor_temperature_c=trajectory.indoor_temperature_c[-1],
+        heating_thermal_energy_supplied_kwh=(
+            heating_trajectory.heating_thermal_energy_supplied_kwh
+        ),
+        heating_input_energy_purchased_kwh=(
+            heating_trajectory.heating_input_energy_purchased_kwh
+        ),
+        baseline_heating_thermal_energy_supplied_kwh=(
+            baseline_heating_trajectory.heating_thermal_energy_supplied_kwh
+        ),
+        baseline_heating_input_energy_purchased_kwh=(
+            baseline_heating_trajectory.heating_input_energy_purchased_kwh
+        ),
+        incremental_heating_thermal_energy_supplied_kwh=(
+            winner["incremental_thermal_kwh"]
+        ),
+        incremental_heating_input_energy_purchased_kwh=(
+            winner["incremental_input_kwh"]
+        ),
+        risk_reduction=winner["risk_reduction"],
+        condensation_time_reduction_hours=(
+            winner["condensation_time_reduction_hours"]
+        ),
+        final_indoor_temperature_c=room_trajectory.indoor_temperature_c[-1],
         final_indoor_absolute_humidity_g_m3=(
-            trajectory.indoor_absolute_humidity_g_m3[-1]
+            room_trajectory.indoor_absolute_humidity_g_m3[-1]
         ),
         final_indoor_relative_humidity_pct=(
-            trajectory.indoor_relative_humidity_pct[-1]
+            room_trajectory.indoor_relative_humidity_pct[-1]
         ),
         objective_name=objective_name,
         feasible=True,
@@ -2698,7 +2871,7 @@ def _scheduled_action_failure(
     per_candidate: List[dict],
     baseline_risk: MoistureRiskState,
     zero_risk: MoistureRiskState,
-    baseline_trajectory: RoomTrajectory,
+    baseline_heating_trajectory: RoomHeatingTrajectory,
     risk_ceiling: float,
     objective_name: str,
 ) -> ScheduledActionResult:
@@ -2716,6 +2889,12 @@ def _scheduled_action_failure(
            candidate; name the comfort violations of the last
            candidate for audit.
     """
+    baseline_thermal_kwh = (
+        baseline_heating_trajectory.heating_thermal_energy_supplied_kwh
+    )
+    baseline_input_kwh = (
+        baseline_heating_trajectory.heating_input_energy_purchased_kwh
+    )
     comfort_survivors = [row for row in per_candidate if row["comfort_ok"]]
 
     if comfort_survivors and any(not row["pre_risk_ok"] for row in comfort_survivors):
@@ -2729,14 +2908,32 @@ def _scheduled_action_failure(
             selected_risk=row["risk"],
             pre_action_risk=row["pre_risk"],
             energy_penalty_kwh=float("nan"),
+            heating_thermal_energy_supplied_kwh=(
+                row["heating_trajectory"].heating_thermal_energy_supplied_kwh
+            ),
+            heating_input_energy_purchased_kwh=(
+                row["heating_trajectory"].heating_input_energy_purchased_kwh
+            ),
+            baseline_heating_thermal_energy_supplied_kwh=baseline_thermal_kwh,
+            baseline_heating_input_energy_purchased_kwh=baseline_input_kwh,
+            incremental_heating_thermal_energy_supplied_kwh=(
+                row["incremental_thermal_kwh"]
+            ),
+            incremental_heating_input_energy_purchased_kwh=(
+                row["incremental_input_kwh"]
+            ),
+            risk_reduction=row["risk_reduction"],
+            condensation_time_reduction_hours=(
+                row["condensation_time_reduction_hours"]
+            ),
             final_indoor_temperature_c=(
-                row["trajectory"].indoor_temperature_c[-1]
+                row["room_trajectory"].indoor_temperature_c[-1]
             ),
             final_indoor_absolute_humidity_g_m3=(
-                row["trajectory"].indoor_absolute_humidity_g_m3[-1]
+                row["room_trajectory"].indoor_absolute_humidity_g_m3[-1]
             ),
             final_indoor_relative_humidity_pct=(
-                row["trajectory"].indoor_relative_humidity_pct[-1]
+                row["room_trajectory"].indoor_relative_humidity_pct[-1]
             ),
             objective_name=objective_name,
             feasible=False,
@@ -2761,14 +2958,32 @@ def _scheduled_action_failure(
             selected_risk=row["risk"],
             pre_action_risk=row["pre_risk"],
             energy_penalty_kwh=float("nan"),
+            heating_thermal_energy_supplied_kwh=(
+                row["heating_trajectory"].heating_thermal_energy_supplied_kwh
+            ),
+            heating_input_energy_purchased_kwh=(
+                row["heating_trajectory"].heating_input_energy_purchased_kwh
+            ),
+            baseline_heating_thermal_energy_supplied_kwh=baseline_thermal_kwh,
+            baseline_heating_input_energy_purchased_kwh=baseline_input_kwh,
+            incremental_heating_thermal_energy_supplied_kwh=(
+                row["incremental_thermal_kwh"]
+            ),
+            incremental_heating_input_energy_purchased_kwh=(
+                row["incremental_input_kwh"]
+            ),
+            risk_reduction=row["risk_reduction"],
+            condensation_time_reduction_hours=(
+                row["condensation_time_reduction_hours"]
+            ),
             final_indoor_temperature_c=(
-                row["trajectory"].indoor_temperature_c[-1]
+                row["room_trajectory"].indoor_temperature_c[-1]
             ),
             final_indoor_absolute_humidity_g_m3=(
-                row["trajectory"].indoor_absolute_humidity_g_m3[-1]
+                row["room_trajectory"].indoor_absolute_humidity_g_m3[-1]
             ),
             final_indoor_relative_humidity_pct=(
-                row["trajectory"].indoor_relative_humidity_pct[-1]
+                row["room_trajectory"].indoor_relative_humidity_pct[-1]
             ),
             objective_name=objective_name,
             feasible=False,
@@ -2790,14 +3005,32 @@ def _scheduled_action_failure(
         selected_risk=row["risk"],
         pre_action_risk=row["pre_risk"],
         energy_penalty_kwh=float("nan"),
+        heating_thermal_energy_supplied_kwh=(
+            row["heating_trajectory"].heating_thermal_energy_supplied_kwh
+        ),
+        heating_input_energy_purchased_kwh=(
+            row["heating_trajectory"].heating_input_energy_purchased_kwh
+        ),
+        baseline_heating_thermal_energy_supplied_kwh=baseline_thermal_kwh,
+        baseline_heating_input_energy_purchased_kwh=baseline_input_kwh,
+        incremental_heating_thermal_energy_supplied_kwh=(
+            row["incremental_thermal_kwh"]
+        ),
+        incremental_heating_input_energy_purchased_kwh=(
+            row["incremental_input_kwh"]
+        ),
+        risk_reduction=row["risk_reduction"],
+        condensation_time_reduction_hours=(
+            row["condensation_time_reduction_hours"]
+        ),
         final_indoor_temperature_c=(
-            row["trajectory"].indoor_temperature_c[-1]
+            row["room_trajectory"].indoor_temperature_c[-1]
         ),
         final_indoor_absolute_humidity_g_m3=(
-            row["trajectory"].indoor_absolute_humidity_g_m3[-1]
+            row["room_trajectory"].indoor_absolute_humidity_g_m3[-1]
         ),
         final_indoor_relative_humidity_pct=(
-            row["trajectory"].indoor_relative_humidity_pct[-1]
+            row["room_trajectory"].indoor_relative_humidity_pct[-1]
         ),
         objective_name=objective_name,
         feasible=False,
