@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import List, Sequence, Tuple
 
+from heating import HeatingModel, NoHeating
 from moisture import (
     MINUTES_PER_HOUR,
     Room,
@@ -42,7 +43,11 @@ from psychrometrics import (
     AirState,
     relative_humidity_from_absolute_humidity,
 )
-from thermal import ThermalProperties, predict_indoor_temperature
+from thermal import (
+    JOULES_PER_KWH,
+    ThermalProperties,
+    predict_indoor_temperature,
+)
 from weather_forecast import WeatherForecast
 
 
@@ -442,4 +447,288 @@ def simulate_room_period_with_forecast(
         outdoor_absolute_humidity_g_m3=tuple(outdoor_ahs),
         window_open=tuple(window_states),
         moisture_generation_g_per_hour=tuple(generation_rates),
+    )
+
+
+@dataclass(frozen=True)
+class RoomHeatingTrajectory:
+    """Trajectory carrying the heating time series alongside the room state.
+
+    Extends ``RoomTrajectory`` with three additional per-sample
+    tuples describing what the heating system did over each step.
+    The room-state fields on ``trajectory`` are exactly the ones on
+    ``RoomTrajectory`` and share the same semantics (piecewise-
+    constant lookups at the START of each step; step-end recording).
+
+    Fields:
+        trajectory: the underlying ``RoomTrajectory`` (times, indoor
+            T, indoor AH, indoor RH, outdoor T / AH, window state,
+            moisture generation). The indoor_temperature_c series
+            already reflects heating input via operator splitting -
+            it is not the ventilation-only value.
+        heater_on: whether the heater was ON during the step ending
+            at each sample time. The first element records the state
+            AT t = 0 (equal to the caller-supplied initial state);
+            index i >= 1 records the heater's state during the step
+            ``(times_hours[i-1], times_hours[i]]``.
+        heating_thermal_power_w: heat delivered to the room during
+            each step, in watts (thermal side). Zero when the heater
+            was OFF that step. Non-negative.
+        heating_input_power_w: input energy per unit time the
+            occupant purchased during the step, in watts. Equal to
+            ``heating_thermal_power_w / efficiency_or_cop`` per the
+            active ``HeatingModel``. Non-negative.
+        ventilation_heat_removed_kwh: total sensible heat that left
+            the room via the window over the run. Sign convention:
+            positive = heat left. Includes ALL ventilation cooling,
+            not just window-open events (a room at ACH_closed also
+            loses some heat when indoor > outdoor).
+        heating_thermal_energy_supplied_kwh: total heat DELIVERED to
+            the room by the heater, in kWh. Non-negative.
+        heating_input_energy_purchased_kwh: total input energy the
+            occupant purchased (electricity or gas), in kWh.
+            Non-negative. Divides supplied thermal by the model's
+            efficiency / COP.
+
+    Sign / bookkeeping notes:
+        The three totals are DISTINCT quantities the caller asked
+        to keep separate. In particular
+        ``heating_input_energy_purchased_kwh`` is what the occupant
+        pays for; the other two live inside the room's thermal
+        balance. On a resistive heater
+        ``input == supplied``; on a heat pump ``input < supplied``
+        by the COP.
+    """
+
+    trajectory: RoomTrajectory
+    heater_on: Tuple[bool, ...]
+    heating_thermal_power_w: Tuple[float, ...]
+    heating_input_power_w: Tuple[float, ...]
+    ventilation_heat_removed_kwh: float
+    heating_thermal_energy_supplied_kwh: float
+    heating_input_energy_purchased_kwh: float
+
+
+def simulate_room_period_with_heating(
+    room: Room,
+    thermal_properties: ThermalProperties,
+    forecast: WeatherForecast,
+    moisture_schedule: MoistureSourceSchedule,
+    ventilation_events: Sequence[VentilationEvent],
+    heating_model: HeatingModel,
+    duration_hours: float,
+    timestep_minutes: float,
+    initial_heater_on: bool = False,
+) -> RoomHeatingTrajectory:
+    """Simulate the room over a horizon with ventilation, sources, and heating.
+
+    Extends ``simulate_room_period_with_forecast`` with a heating
+    step per timestep, applied via operator splitting alongside the
+    ventilation temperature update. On each step:
+
+        1. Look up window state, moisture generation rate, and the
+           outdoor state at the step start (piecewise-constant).
+        2. Advance moisture with the ventilation ODE, then add the
+           source term (unchanged from the forecast variant).
+        3. Advance temperature with the ventilation ODE (still the
+           analytic first-order solution).
+        4. Ask the heating model whether the heater switches on/off
+           for this step, given the POST-ventilation temperature
+           and the previous step's heater state. If ON, add
+           ``thermal_power_w * dt / C_eff`` to the temperature.
+        5. Recompute step-end RH from step-end T and AH.
+        6. Accumulate ventilation heat removed this step, heating
+           thermal energy supplied this step, and heating input
+           energy purchased this step.
+
+    The heating decision uses the POST-ventilation temperature so
+    the heater "sees" the room after the window has cooled it - a
+    reasonable proxy for a thermostat sampling every few minutes.
+    The operator-split heating rise is a first-order approximation
+    to the true continuous ODE with a heat source; refining to a
+    joint analytic solution is a later slice.
+
+    Args:
+        room, thermal_properties, forecast, moisture_schedule,
+        ventilation_events, duration_hours, timestep_minutes: same
+            as ``simulate_room_period_with_forecast``.
+        heating_model: any concrete ``HeatingModel``
+            (``NoHeating`` or ``ThermostaticHeating``, or a user's
+            subclass). Consulted every step.
+        initial_heater_on: whether the heater is ON at t = 0.
+            Defaults to False. Callers whose scenario begins with
+            the heater already on can override.
+
+    Returns:
+        A ``RoomHeatingTrajectory``.
+
+    Raises:
+        ValueError: from the underlying simulator; from the heating
+            model on invalid indoor temperature.
+    """
+    if not isfinite(duration_hours):
+        raise ValueError(
+            f"duration_hours must be finite, got {duration_hours!r}"
+        )
+    if duration_hours < 0.0:
+        raise ValueError(
+            f"duration_hours must be non-negative, got {duration_hours}"
+        )
+    if not isfinite(timestep_minutes):
+        raise ValueError(
+            f"timestep_minutes must be finite, got {timestep_minutes!r}"
+        )
+    if timestep_minutes <= 0.0:
+        raise ValueError(
+            "timestep_minutes must be strictly positive, got "
+            f"{timestep_minutes}"
+        )
+
+    step_hours = timestep_minutes / MINUTES_PER_HOUR
+    step_seconds = timestep_minutes * 60.0
+    c_eff = thermal_properties.effective_thermal_capacity_j_per_k
+
+    if duration_hours == 0.0:
+        step_count = 0
+    else:
+        step_count = int(duration_hours / step_hours + 1e-9)
+
+    initial_air_state = AirState(
+        temperature_c=room.indoor_temperature_c,
+        relative_humidity_percent=room.indoor_relative_humidity_pct,
+    )
+    indoor_ah = initial_air_state.absolute_humidity
+    indoor_t = room.indoor_temperature_c
+    heater_currently_on = initial_heater_on
+
+    outdoor_at_zero = forecast.sample_at(0.0)
+    times: List[float] = [0.0]
+    indoor_temperatures: List[float] = [indoor_t]
+    indoor_ahs: List[float] = [indoor_ah]
+    indoor_rhs: List[float] = [room.indoor_relative_humidity_pct]
+    outdoor_ts: List[float] = [outdoor_at_zero.temperature_c]
+    outdoor_ahs: List[float] = [outdoor_at_zero.absolute_humidity]
+    window_states: List[bool] = [_is_window_open_at(ventilation_events, 0.0)]
+    generation_rates: List[float] = [
+        moisture_generation_rate_g_per_hour_at(moisture_schedule, 0.0)
+    ]
+    heater_ons: List[bool] = [heater_currently_on]
+    heating_thermal_powers_w: List[float] = [0.0]
+    heating_input_powers_w: List[float] = [0.0]
+
+    ventilation_heat_removed_joules = 0.0
+    heating_thermal_energy_supplied_joules = 0.0
+    heating_input_energy_purchased_joules = 0.0
+
+    for step_index in range(step_count):
+        time_now_hours = step_index * step_hours
+
+        window_is_open = _is_window_open_at(
+            ventilation_events, time_now_hours
+        )
+        ach = (
+            room.ach_window_open if window_is_open else room.ach_closed
+        )
+        generation_g_per_hour = moisture_generation_rate_g_per_hour_at(
+            moisture_schedule, time_now_hours
+        )
+        outdoor_now = forecast.sample_at(time_now_hours)
+        outdoor_ah_now = outdoor_now.absolute_humidity
+
+        # Moisture step (ventilation + operator-split source term).
+        next_indoor_ah = predict_final_absolute_humidity(
+            indoor_ah_g_m3=indoor_ah,
+            outdoor_ah_g_m3=outdoor_ah_now,
+            ach=ach,
+            duration_minutes=timestep_minutes,
+        )
+        next_indoor_ah = next_indoor_ah + (
+            generation_g_per_hour * step_hours / room.volume_m3
+        )
+
+        # Thermal step: analytic ventilation cooling first ...
+        indoor_t_after_ventilation = predict_indoor_temperature(
+            initial_indoor_temperature_c=indoor_t,
+            outdoor_temperature_c=outdoor_now.temperature_c,
+            room_volume_m3=room.volume_m3,
+            ach=ach,
+            effective_thermal_capacity_j_per_k=c_eff,
+            duration_minutes=timestep_minutes,
+        )
+        # ... then operator-split heating rise, driven by the
+        # heater's response to the post-ventilation temperature.
+        response = heating_model.respond_to_indoor_temperature(
+            indoor_temperature_c=indoor_t_after_ventilation,
+            currently_on=heater_currently_on,
+        )
+        temperature_rise_from_heating = (
+            response.thermal_power_w * step_seconds / c_eff
+        )
+        next_indoor_t = (
+            indoor_t_after_ventilation + temperature_rise_from_heating
+        )
+
+        # Book-keeping. Ventilation heat REMOVED is the drop the
+        # ventilation step alone produced (before heating restored
+        # any of it), converted to joules via the room's C_eff.
+        # Negative drop (outdoor warmer than indoor) reads back as
+        # negative removed - heat was ADDED by ventilation.
+        ventilation_temperature_drop_k = indoor_t - indoor_t_after_ventilation
+        ventilation_heat_removed_joules += (
+            c_eff * ventilation_temperature_drop_k
+        )
+        heating_thermal_energy_supplied_joules += (
+            response.thermal_power_w * step_seconds
+        )
+        heating_input_energy_purchased_joules += (
+            response.input_power_w * step_seconds
+        )
+
+        # Step-end RH.
+        next_indoor_rh = relative_humidity_from_absolute_humidity(
+            temperature_c=next_indoor_t,
+            absolute_humidity_g_m3=next_indoor_ah,
+        )
+
+        step_end_hours = (step_index + 1) * step_hours
+        times.append(step_end_hours)
+        indoor_temperatures.append(next_indoor_t)
+        indoor_ahs.append(next_indoor_ah)
+        indoor_rhs.append(next_indoor_rh)
+        outdoor_ts.append(outdoor_now.temperature_c)
+        outdoor_ahs.append(outdoor_ah_now)
+        window_states.append(window_is_open)
+        generation_rates.append(generation_g_per_hour)
+        heater_ons.append(response.next_on)
+        heating_thermal_powers_w.append(response.thermal_power_w)
+        heating_input_powers_w.append(response.input_power_w)
+
+        indoor_ah = next_indoor_ah
+        indoor_t = next_indoor_t
+        heater_currently_on = response.next_on
+
+    trajectory = RoomTrajectory(
+        times_hours=tuple(times),
+        indoor_temperature_c=tuple(indoor_temperatures),
+        indoor_absolute_humidity_g_m3=tuple(indoor_ahs),
+        indoor_relative_humidity_pct=tuple(indoor_rhs),
+        outdoor_temperature_c=tuple(outdoor_ts),
+        outdoor_absolute_humidity_g_m3=tuple(outdoor_ahs),
+        window_open=tuple(window_states),
+        moisture_generation_g_per_hour=tuple(generation_rates),
+    )
+    return RoomHeatingTrajectory(
+        trajectory=trajectory,
+        heater_on=tuple(heater_ons),
+        heating_thermal_power_w=tuple(heating_thermal_powers_w),
+        heating_input_power_w=tuple(heating_input_powers_w),
+        ventilation_heat_removed_kwh=(
+            ventilation_heat_removed_joules / JOULES_PER_KWH
+        ),
+        heating_thermal_energy_supplied_kwh=(
+            heating_thermal_energy_supplied_joules / JOULES_PER_KWH
+        ),
+        heating_input_energy_purchased_kwh=(
+            heating_input_energy_purchased_joules / JOULES_PER_KWH
+        ),
     )
