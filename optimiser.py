@@ -117,8 +117,12 @@ from math import isfinite
 from typing import List, Optional, Sequence, Tuple
 
 from moisture import Room
+from moisture_sources import MoistureSourceSchedule
+from mould_risk import MoistureRiskState, RiskConfig, evaluate_moisture_risk
 from psychrometrics import AirState
+from surface_risk import SurfaceDescriptor
 from thermal import ThermalProperties
+from time_simulation import VentilationEvent, simulate_room_period
 from ventilation import VentilationSimulationResult, simulate_ventilation_event
 
 
@@ -248,6 +252,16 @@ class VentilationConstraints:
     minimum_water_removed_g: Optional[float] = None
     minimum_absolute_humidity_reduction_g_m3: Optional[float] = None
     minimum_marginal_g_per_kwh: Optional[float] = None
+    max_cumulative_risk_score: Optional[float] = None
+    """Ceiling on the ``mould_risk`` cumulative-risk INDICATOR over the
+    control horizon. Consumed only by
+    ``optimise_min_energy_under_risk_limit``. A candidate is REJECTED
+    when the predicted horizon-wide cumulative_risk_score STRICTLY
+    EXCEEDS this ceiling. The units and meaning of the score are set
+    by the caller's ``RiskConfig`` weights, and the score is NOT a
+    validated mould-growth prediction (see the ``mould_risk`` module
+    docstring). None means the risk constraint is not enforced.
+    """
 
     def __post_init__(self) -> None:
         """Validate every non-None field: finite and non-negative."""
@@ -270,6 +284,10 @@ class VentilationConstraints:
             (
                 "minimum_marginal_g_per_kwh",
                 self.minimum_marginal_g_per_kwh,
+            ),
+            (
+                "max_cumulative_risk_score",
+                self.max_cumulative_risk_score,
             ),
         ):
             if value is None:
@@ -1688,6 +1706,423 @@ def optimise_marginal_efficiency_threshold(
     return OptimisationResult(
         selected_duration_minutes=selected_duration,
         selected_prediction=selected_prediction,
+        objective_name=objective_name,
+        feasible=True,
+        reason=reason,
+    )
+
+
+@dataclass(frozen=True)
+class RiskConstrainedOptimisationResult:
+    """Selected ventilation action under a surface-risk constraint.
+
+    Distinct from ``OptimisationResult`` because a risk-constrained
+    decision carries context the moisture-target strategies do not:
+    the predicted risk both WITHOUT and WITH the selected action, and
+    an explicit energy penalty for taking the action.
+
+    Fields:
+        selected_duration_minutes: the winning candidate's duration.
+            Set to 0.0 (do nothing) when that is the correct answer,
+            or NaN when no candidate satisfies the risk / comfort
+            constraints. Callers should branch on ``feasible`` before
+            reading this field.
+        selected_prediction: the single-event
+            ``VentilationSimulationResult`` for the winning candidate.
+            When infeasible, this is the LAST candidate the optimiser
+            looked at, retained for audit.
+        baseline_risk: predicted ``MoistureRiskState`` over the control
+            horizon if NO ventilation is applied (the "do nothing"
+            trajectory). Always populated; callers can inspect it to
+            see what the risk exposure would have been without the
+            recommended action.
+        selected_risk: predicted ``MoistureRiskState`` over the control
+            horizon after the SELECTED action is applied. When
+            infeasible, this is the risk of the LAST candidate the
+            optimiser looked at, retained for audit.
+        energy_penalty_kwh: the winning candidate's
+            ``ventilation_energy_removed_kwh``. The word "penalty" is
+            deliberate: the objective is to minimise energy, so the
+            selected value is exactly the energy cost of choosing
+            this action over do-nothing (0-min do-nothing has zero
+            energy loss). Set to NaN when infeasible.
+        objective_name: fixed at
+            ``"minimum ventilation energy under risk limit"``.
+        feasible: True when at least one candidate satisfied every
+            risk and comfort constraint and was selected.
+        reason: one-sentence explanation. On success, names the
+            energy penalty and the risk margin against the ceiling.
+            On failure, names the tightest constraint that could not
+            be met and reports the risk / comfort values of the
+            closest candidate.
+
+    Sign convention: energy_penalty_kwh follows the simulator's
+    ``ventilation_energy_removed_kwh`` (positive = heat left the
+    room). A summer / wetting event that ADDS heat produces a
+    negative penalty, which is correct - the "cost" of the action is
+    negative because it warmed the room.
+    """
+
+    selected_duration_minutes: float
+    selected_prediction: VentilationSimulationResult
+    baseline_risk: MoistureRiskState
+    selected_risk: MoistureRiskState
+    energy_penalty_kwh: float
+    objective_name: str
+    feasible: bool
+    reason: str
+
+
+def _simulate_candidate_trajectory(
+    room: Room,
+    thermal_properties: ThermalProperties,
+    outdoor: AirState,
+    moisture_schedule: MoistureSourceSchedule,
+    duration_minutes: float,
+    control_horizon_hours: float,
+    trajectory_timestep_minutes: float,
+):
+    """Simulate a room trajectory where the candidate action opens the window at t = 0.
+
+    A duration of 0 minutes produces the no-ventilation baseline
+    trajectory (empty event list). A positive duration produces a
+    single ``VentilationEvent`` starting at t = 0 with length
+    ``duration_minutes / 60`` hours. The rest of the control horizon
+    is spent with the window closed and only background / scheduled
+    moisture sources acting on the room.
+
+    Delegates entirely to ``time_simulation.simulate_room_period`` -
+    no physics is done here.
+    """
+    if duration_minutes > 0.0:
+        events = (
+            VentilationEvent(
+                start_time_hours=0.0,
+                end_time_hours=duration_minutes / 60.0,
+            ),
+        )
+    else:
+        events = ()
+    return simulate_room_period(
+        room=room,
+        thermal_properties=thermal_properties,
+        outdoor=outdoor,
+        moisture_schedule=moisture_schedule,
+        ventilation_events=events,
+        duration_hours=control_horizon_hours,
+        timestep_minutes=trajectory_timestep_minutes,
+    )
+
+
+def optimise_min_energy_under_risk_limit(
+    room: Room,
+    outdoor: AirState,
+    thermal_properties: ThermalProperties,
+    candidate_durations_minutes: Sequence[float],
+    constraints: VentilationConstraints,
+    surface: SurfaceDescriptor,
+    risk_config: RiskConfig,
+    moisture_schedule: MoistureSourceSchedule,
+    control_horizon_hours: float,
+    trajectory_timestep_minutes: float,
+) -> RiskConstrainedOptimisationResult:
+    """Pick the lowest-energy action that keeps predicted surface risk below a limit.
+
+    Solves conceptually:
+
+        minimise   ventilation_energy_removed_kwh
+        subject to horizon-wide cumulative_risk_score
+                   <= constraints.max_cumulative_risk_score
+                   AND temperature_drop_c <= constraints.max_temperature_drop_c
+                   AND every other hard constraint on ``constraints``.
+
+    Distinct from ``choose_minimum_energy_action`` (the moisture-
+    target baseline) in one crucial way: the constraint is on
+    SUSTAINED SURFACE-EXPOSURE across a control horizon, not on the
+    room's final AH after a single ventilation event. This lets the
+    optimiser react to what the caller actually cares about (surface
+    conditions over time) rather than to a proxy (final indoor AH).
+
+    Algorithm:
+        1. For each candidate duration, simulate the room's full
+           trajectory over ``control_horizon_hours``. Duration 0
+           produces the no-ventilation baseline trajectory. A positive
+           duration opens the window at t = 0 for
+           ``duration_minutes / 60`` hours, then closes it for the
+           remainder of the horizon.
+        2. Evaluate the mould-risk indicator on each trajectory via
+           ``mould_risk.evaluate_moisture_risk``.
+        3. Filter candidates by the risk ceiling
+           (``max_cumulative_risk_score``) and the comfort constraints
+           on ``constraints`` (typically ``max_temperature_drop_c``,
+           evaluated on the SINGLE-EVENT simulator result at t = 0).
+        4. Return the feasible candidate with the lowest
+           ``ventilation_energy_removed_kwh``. Ties on energy break to
+           the shorter duration.
+
+    Tie-break: as in the other minimum-energy strategy, energies
+    within ``ENERGY_TIE_TOLERANCE_KWH`` are treated as equal and the
+    shorter duration wins.
+
+    Failure modes (``feasible = False``):
+        * No candidate keeps the risk below the ceiling: the reason
+          names the closest miss (best cumulative_risk_score seen).
+        * No candidate satisfies the comfort constraints: reason
+          names the tightest comfort violation.
+        * ``max_cumulative_risk_score`` is None: this strategy is
+          undefined without a risk ceiling and returns infeasible.
+
+    Delegation contract:
+        Simulator, trajectory, and risk indicator are all delegated
+        to their owning modules (``ventilation``, ``time_simulation``,
+        ``mould_risk``). This strategy contributes decision logic
+        only; it does not compute any physical quantity itself.
+
+    CALIBRATION WARNING:
+        ``max_cumulative_risk_score`` and every field on
+        ``risk_config`` are POC caller inputs, not validated damp /
+        mould / health thresholds. The cumulative_risk_score is a
+        CONFIGURABLE INDICATOR whose interpretation is set by the
+        caller's weights; this optimiser makes it easier to compare
+        actions against a specific caller-set ceiling but does not
+        endorse any particular numeric value. See the ``mould_risk``
+        module docstring for the full disclaimer.
+
+    Args:
+        room: room state.
+        outdoor: outdoor air state, assumed constant across the
+            control horizon.
+        thermal_properties: lumped effective thermal capacity.
+        candidate_durations_minutes: durations to evaluate; must be
+            non-empty. Duration 0 ("do nothing") is a valid
+            candidate; it produces the baseline trajectory and wins
+            when the baseline risk is already acceptable.
+        constraints: ``VentilationConstraints`` describing the risk
+            ceiling and any comfort constraints. At minimum
+            ``max_cumulative_risk_score`` must be set.
+        surface: caller's ``SurfaceDescriptor`` (fRsi and label).
+            Applied to every trajectory to produce the surface RH
+            time series consumed by ``evaluate_moisture_risk``.
+        risk_config: caller's ``RiskConfig`` (thresholds and
+            weights for the risk indicator).
+        moisture_schedule: moisture-source schedule for the control
+            horizon (background + scheduled events like showers /
+            cooking).
+        control_horizon_hours: how far ahead to simulate before
+            evaluating cumulative risk. Must be strictly positive.
+        trajectory_timestep_minutes: step size for
+            ``simulate_room_period``. Must be strictly positive.
+
+    Returns:
+        A ``RiskConstrainedOptimisationResult`` describing the choice.
+    """
+    if not isfinite(control_horizon_hours):
+        raise ValueError(
+            f"control_horizon_hours must be finite, got {control_horizon_hours!r}"
+        )
+    if control_horizon_hours <= 0.0:
+        raise ValueError(
+            "control_horizon_hours must be strictly positive, got "
+            f"{control_horizon_hours}"
+        )
+    if not isfinite(trajectory_timestep_minutes):
+        raise ValueError(
+            "trajectory_timestep_minutes must be finite, got "
+            f"{trajectory_timestep_minutes!r}"
+        )
+    if trajectory_timestep_minutes <= 0.0:
+        raise ValueError(
+            "trajectory_timestep_minutes must be strictly positive, got "
+            f"{trajectory_timestep_minutes}"
+        )
+    if len(candidate_durations_minutes) == 0:
+        raise ValueError(
+            "candidate_durations_minutes must contain at least one duration."
+        )
+
+    objective_name = "minimum ventilation energy under risk limit"
+
+    # Single-event predictions drive the comfort feasibility check
+    # (temperature drop, energy loss, and any moisture targets) via
+    # the existing helper. No physics runs here; every value comes
+    # from the simulator.
+    event_evaluations = evaluate_candidate_durations_with_constraints(
+        room=room,
+        outdoor=outdoor,
+        thermal_properties=thermal_properties,
+        candidate_durations_minutes=candidate_durations_minutes,
+        constraints=constraints,
+    )
+
+    # The baseline (0-min "do nothing") trajectory over the control
+    # horizon. Every result reports this so the caller can see the
+    # counterfactual regardless of the chosen action.
+    baseline_trajectory = _simulate_candidate_trajectory(
+        room=room,
+        thermal_properties=thermal_properties,
+        outdoor=outdoor,
+        moisture_schedule=moisture_schedule,
+        duration_minutes=0.0,
+        control_horizon_hours=control_horizon_hours,
+        trajectory_timestep_minutes=trajectory_timestep_minutes,
+    )
+    baseline_risk = evaluate_moisture_risk(
+        trajectory=baseline_trajectory,
+        surface=surface,
+        config=risk_config,
+    )
+
+    if constraints.max_cumulative_risk_score is None:
+        # Without a ceiling there is no risk limit to enforce. Refuse
+        # rather than pick arbitrarily.
+        return RiskConstrainedOptimisationResult(
+            selected_duration_minutes=float("nan"),
+            selected_prediction=event_evaluations[-1].prediction,
+            baseline_risk=baseline_risk,
+            selected_risk=baseline_risk,
+            energy_penalty_kwh=float("nan"),
+            objective_name=objective_name,
+            feasible=False,
+            reason=(
+                "no max_cumulative_risk_score configured; this strategy "
+                "minimises ventilation energy subject to a caller-set risk "
+                "ceiling and therefore requires the ceiling to be set."
+            ),
+        )
+
+    risk_ceiling = constraints.max_cumulative_risk_score
+
+    # Per-candidate: simulate trajectory, evaluate risk, tag comfort
+    # feasibility from the single-event check.
+    per_candidate: List[Tuple[float, VentilationSimulationResult, MoistureRiskState, bool, Tuple[str, ...]]] = []
+    for duration_minutes, event_evaluation in zip(
+        candidate_durations_minutes, event_evaluations
+    ):
+        if duration_minutes == 0.0:
+            trajectory = baseline_trajectory
+            risk = baseline_risk
+        else:
+            trajectory = _simulate_candidate_trajectory(
+                room=room,
+                thermal_properties=thermal_properties,
+                outdoor=outdoor,
+                moisture_schedule=moisture_schedule,
+                duration_minutes=duration_minutes,
+                control_horizon_hours=control_horizon_hours,
+                trajectory_timestep_minutes=trajectory_timestep_minutes,
+            )
+            risk = evaluate_moisture_risk(
+                trajectory=trajectory,
+                surface=surface,
+                config=risk_config,
+            )
+        # Comfort feasibility from the single-event check; the risk
+        # check is applied here rather than through
+        # ``_check_feasibility`` because the risk ceiling is
+        # trajectory-derived and lives outside the simulator's
+        # per-event result set.
+        risk_ok = risk.cumulative_risk_score <= risk_ceiling
+        comfort_ok = event_evaluation.feasible
+        per_candidate.append(
+            (
+                duration_minutes,
+                event_evaluation.prediction,
+                risk,
+                risk_ok and comfort_ok,
+                event_evaluation.violated_constraints,
+            )
+        )
+
+    feasible = [row for row in per_candidate if row[3]]
+
+    if not feasible:
+        # Diagnose the closest miss. Prefer to report the tightest
+        # unmet constraint - if any candidate cleared comfort, name
+        # the risk overshoot; otherwise name the comfort violations.
+        comfort_ok_rows = [
+            row for row in per_candidate if not row[4]  # no comfort violations
+        ]
+        if comfort_ok_rows:
+            # Comfort was achievable for at least one candidate; the
+            # risk ceiling is what nobody could clear.
+            best_by_risk = min(
+                comfort_ok_rows,
+                key=lambda row: row[2].cumulative_risk_score,
+            )
+            duration, prediction, risk, _, _ = best_by_risk
+            return RiskConstrainedOptimisationResult(
+                selected_duration_minutes=float("nan"),
+                selected_prediction=prediction,
+                baseline_risk=baseline_risk,
+                selected_risk=risk,
+                energy_penalty_kwh=float("nan"),
+                objective_name=objective_name,
+                feasible=False,
+                reason=(
+                    "no candidate keeps the predicted cumulative risk "
+                    f"score at or below {risk_ceiling:g}; the lowest-risk "
+                    f"candidate satisfying comfort was duration "
+                    f"{duration:g} min with predicted score "
+                    f"{risk.cumulative_risk_score:.4f} (baseline "
+                    f"{baseline_risk.cumulative_risk_score:.4f}). "
+                    "Consider relaxing the ceiling, extending the "
+                    "candidate durations, or revisiting the risk config."
+                ),
+            )
+        # No candidate cleared comfort. Report the comfort violation.
+        last_prediction = event_evaluations[-1].prediction
+        last_row = per_candidate[-1]
+        return RiskConstrainedOptimisationResult(
+            selected_duration_minutes=float("nan"),
+            selected_prediction=last_prediction,
+            baseline_risk=baseline_risk,
+            selected_risk=last_row[2],
+            energy_penalty_kwh=float("nan"),
+            objective_name=objective_name,
+            feasible=False,
+            reason=(
+                "no candidate satisfies the comfort constraints "
+                f"({', '.join(last_row[4]) or 'unspecified'}); the "
+                "risk ceiling could not be checked in isolation because "
+                "comfort filtering removed every candidate."
+            ),
+        )
+
+    winner = min(
+        feasible,
+        key=lambda row: (
+            _energy_tie_bucket(row[1].ventilation_energy_removed_kwh),
+            row[0],
+        ),
+    )
+    winner_duration, winner_prediction, winner_risk, _, _ = winner
+
+    if winner_duration == 0.0:
+        reason = (
+            "predicted baseline cumulative risk score "
+            f"{baseline_risk.cumulative_risk_score:.4f} is already at or "
+            f"below the ceiling {risk_ceiling:g}; do-nothing is the "
+            "lowest-energy feasible action and no ventilation is "
+            "recommended over this control horizon."
+        )
+    else:
+        reason = (
+            f"duration {winner_duration:g} min is the lowest-energy "
+            f"candidate whose predicted cumulative risk score "
+            f"{winner_risk.cumulative_risk_score:.4f} stays at or below "
+            f"the ceiling {risk_ceiling:g} (baseline without action would "
+            f"have been {baseline_risk.cumulative_risk_score:.4f}). "
+            f"Energy penalty "
+            f"{winner_prediction.ventilation_energy_removed_kwh:.4f} kWh; "
+            "ties broken by shortest duration."
+        )
+
+    return RiskConstrainedOptimisationResult(
+        selected_duration_minutes=winner_duration,
+        selected_prediction=winner_prediction,
+        baseline_risk=baseline_risk,
+        selected_risk=winner_risk,
+        energy_penalty_kwh=winner_prediction.ventilation_energy_removed_kwh,
         objective_name=objective_name,
         feasible=True,
         reason=reason,
